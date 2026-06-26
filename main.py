@@ -30,25 +30,32 @@ DEEPSEEK_MODEL = "deepseek-chat"
 
 HISTORY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "history.json")
 
-# ─── 数据源 ──────────────────────────────────────────────────────────────────
+# ─── 数据源 ─ 全部为政策分析与智库深度文章 ────────────────────────────────
 
-# 中国官方政策（网页抓取）
-GOV_SOURCES = {
-    "国务院政策": "https://www.gov.cn/zhengce/zuixin.htm",
-    "发改委政策": "https://www.ndrc.gov.cn/xwdt/xwfb/",
-    "财政部政策": "https://www.mof.gov.cn/zhengwuxinxi/zhengcefabu/",
+ANALYSIS_SOURCES = {
+    "知乎·政策": ("https://rsshub.app/zhihu/topic/19550857", True),
+    "外交学者": ("https://thediplomat.com/feed/", False),
+    "第六声": ("https://www.sixthtone.com/rss", False),
+    "LSE中国": ("https://blogs.lse.ac.uk/cff/feed/", False),
+    "财新博客": ("https://www.caixinglobal.com/feed/", False),
+    "中国发展简报": ("https://chinadevelopmentbrief.org/feed/", False),
 }
 
-# 外部深度分析（RSS）
-EXTERNAL_RSS = {
-    "外交学者": "https://thediplomat.com/feed/",
-    "南华早报": "https://www.scmp.com/rss/4/feed",
-    "第六声": "https://www.sixthtone.com/rss",
-    "LSE中国": "https://blogs.lse.ac.uk/cff/feed/",
-}
-
-MAX_PER_SOURCE = 3
+MAX_PER_SOURCE = 4
 DAILY_TOTAL = 8
+
+# 政策/体制相关关键词（用于过滤）
+POLICY_KW = re.compile(
+    r'政策|改革|体制|治理|监管|法规|文件|国务院|部委|发改委|财政部|央行|'
+    r'经济|产业|税收|财政|货币|金融|外贸|投资|基建|房地产|就业|民生|社保|'
+    r'两会|中央|政治局|常委|十四五|双循环|共同富裕|新质生产力|高质量发展|'
+    r'china|beijing|policy|regulation|reform|economy|trade| governance',
+    re.IGNORECASE,
+)
+
+
+def is_policy_related(title: str, text: str) -> bool:
+    return bool(POLICY_KW.search(f"{title} {text[:500]}"))
 
 # ─── 网页抓取 ────────────────────────────────────────────────────────────────
 
@@ -59,70 +66,8 @@ def get_session():
     if proxy_url:
         s.proxies = {"https": proxy_url, "http": proxy_url.replace("https", "http")}
     s.trust_env = False
-    s.headers.update({"User-Agent": "Mozilla/5.0 (compatible; PolicyTracker/1.0)"})
+    s.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"})
     return s
-
-
-def scrape_gov_page(name: str, url: str, max_n: int) -> List[Dict[str, Any]]:
-    """抓取中国政府网页的政策文件列表。"""
-    docs: List[Dict[str, Any]] = []
-    try:
-        session = get_session()
-        resp = session.get(url, timeout=30)
-        resp.raise_for_status()
-        # 处理中文编码
-        resp.encoding = resp.apparent_encoding or 'utf-8'
-        soup = BeautifulSoup(resp.text, 'html.parser')
-
-        # 找政策文件链接（常见 class/id 模式）
-        items = (
-            soup.select('ul.listTxt li') or
-            soup.select('.news_box li') or
-            soup.select('.list li') or
-            soup.select('li a[href*="content"]') or
-            soup.select('a[href*="zhengce"]') or
-            soup.find_all('a', href=re.compile(r'(content|zhengce|xinxi|fabu)'))
-        )
-
-        count = 0
-        seen = set()
-        for item in items:
-            if count >= max_n:
-                break
-            a_tag = item if item.name == 'a' else item.find('a')
-            if not a_tag:
-                continue
-            title = a_tag.get_text(strip=True)
-            href = a_tag.get('href', '')
-            if not title or not href or len(title) < 8:
-                continue
-            # 补全 URL
-            if href.startswith('/'):
-                from urllib.parse import urljoin
-                href = urljoin(url, href)
-            if href in seen:
-                continue
-            seen.add(href)
-
-            # 日期
-            date_span = item.find('span') or item.find('em')
-            pub_date = date_span.get_text(strip=True) if date_span else ''
-
-            # 抓取全文
-            full_text = fetch_full_text(href)
-            abstract = full_text[:3000] if full_text else title
-
-            docs.append({
-                "title": title, "abstract": abstract, "url": href,
-                "published": pub_date or datetime.now().strftime("%Y-%m-%d"),
-                "source": name, "type": "official",
-            })
-            count += 1
-
-        logger.info("  %s: %d 篇", name, len(docs))
-    except Exception as exc:
-        logger.warning("  %s 抓取失败: %s", name, exc)
-    return docs
 
 
 def fetch_full_text(url: str) -> str:
@@ -150,25 +95,20 @@ def fetch_full_text(url: str) -> str:
     return ""
 
 
-def fetch_rss(name: str, url: str, max_n: int) -> List[Dict[str, Any]]:
-    """RSS 获取外部分析。"""
+def fetch_rss(name: str, url: str, max_n: int, need_filter: bool = False) -> List[Dict[str, Any]]:
+    """RSS 获取政策分析文章。"""
     docs: List[Dict[str, Any]] = []
     try:
         session = get_session()
         resp = session.get(url, timeout=45)
         resp.raise_for_status()
         feed = feedparser.parse(resp.text)
-        # 过滤中国/政策相关内容
-        china_kw = re.compile(
-            r'china|中国|beijing|xi|communist|politburo|policy|regulation|reform|economy|trade|belt.*road|一带一路|双循环|共同富裕',
-            re.IGNORECASE,
-        )
-        for entry in feed.entries[:max_n * 2]:
+        for entry in feed.entries[:max_n * 3]:
             title = entry.get("title", "")
             summary = entry.get("summary", entry.get("description", ""))
             summary = re.sub(r"<[^>]+>", "", summary)
             summary = " ".join(summary.split())
-            if not china_kw.search(f"{title} {summary}"):
+            if need_filter and not is_policy_related(title, summary):
                 continue
             pub_str = entry.get("published", entry.get("updated", ""))
             pub_date = pub_str[:10] if pub_str else ""
@@ -178,7 +118,7 @@ def fetch_rss(name: str, url: str, max_n: int) -> List[Dict[str, Any]]:
             docs.append({
                 "title": title, "abstract": content, "url": link,
                 "published": pub_date or datetime.now().strftime("%Y-%m-%d"),
-                "source": name, "type": "external",
+                "source": name, "type": "analysis",
             })
             if len(docs) >= max_n:
                 break
@@ -206,23 +146,22 @@ def deepseek_analyze(doc: Dict[str, Any], api_key: str) -> Optional[str]:
     if not api_key:
         return None
 
-    doc_type = "官方政策文件" if doc["type"] == "official" else "外部政策分析"
-    prompt = f"""你是一位资深政策分析师，擅长解读中国体制内文本逻辑与政策信号。
+    prompt = f"""你是一位资深中国政策分析师。请深度解读下面的政策分析文章，挖掘文字背后的体制逻辑和深层含义。
 
-来源：{doc['source']}（{doc_type}）
+来源：{doc['source']}
 标题：{doc['title']}
-正文：{doc['abstract'][:4000]}
+正文：{doc['abstract'][:5000]}
 
-请按以下三段式输出（每段 4-6 句，专业但不官僚，纯文本不要Markdown）：
+请按以下三段式输出（每段 5-8 句，要有深度和洞见，纯文本不要Markdown）：
 
-【政策要点】
-这篇文件/文章的核心内容是什么？涉及哪些具体领域（产业、财税、金融、民生、外贸等）？有哪些关键的新提法、新表述或量化目标？请用通俗语言概括。
+【核心信号】
+这篇文章揭示了什么关键政策动向或治理逻辑？不要复述文章表面内容，而是提炼出最值得关注的1-2个核心信号。为什么这个信号在当下值得关注？它和之前有哪些不同或延续？
 
-【体制逻辑】
-从制度设计角度看，这个政策背后的驱动逻辑是什么？它反映了决策层对什么问题的判断？和近期的其他政策有什么关联？文件中那些看似套话的表述（如"稳中求进""统筹兼顾"）在当下语境中实际传递了什么信号？
+【体制逻辑拆解】
+这个政策/现象背后的制度驱动因素是什么？涉及央地关系、部门博弈、激励结构还是发展范式转换？文中的"套话"（如"高质量发展""统筹发展与安全""先立后破"等）在当下语境中实际上在暗示什么约束或方向？请做有深度的体制内文本分析，不要停留在字面意思。
 
-【影响推演】
-这个政策对不同主体（地方政府、企业、投资者、普通民众）可能产生什么影响？哪些行业或领域会受益/承压？有什么值得持续跟踪的后续动向？"""
+【推演与启示】
+基于这个信号，未来3-6个月可能出现什么变化？对哪些行业/企业/群体是机遇，哪些是风险？如果你要给决策者或投资者写一份备忘录，你会怎么建议？"""
 
     try:
         resp = requests.post(
@@ -272,20 +211,18 @@ def build_html(docs: List[Dict[str, Any]], date_str: str, week_num: int) -> str:
     if not interpreted:
         return "<p>暂无解读内容</p>"
 
-    type_emoji = {"official": "🏛️", "external": "🌐"}
-    type_label = {"official": "官方文件", "external": "外部分析"}
-    type_color = {"official": "#dc2626", "external": "#2563eb"}
+    type_emoji = {"analysis": "🔍"}
+    type_color = {"analysis": "#7c3aed"}
 
     cards = []
     for doc in interpreted:
-        dt = doc.get("type", "external")
+        dt = doc.get("type", "analysis")
         emoji = type_emoji.get(dt, "📄")
-        label = type_label.get(dt, "")
-        color = type_color.get(dt, "#6b7280")
+        color = type_color.get(dt, "#7c3aed")
         interp = doc.get("interpretation", "")
 
         sections: Dict[str, str] = {}
-        for key in ["政策要点", "体制逻辑", "影响推演"]:
+        for key in ["核心信号", "体制逻辑拆解", "推演与启示"]:
             marker = f"【{key}】"
             if marker in interp:
                 parts = interp.split(marker, 1)
@@ -293,9 +230,9 @@ def build_html(docs: List[Dict[str, Any]], date_str: str, week_num: int) -> str:
                     sections[key] = parts[1].split("【")[0].strip()
 
         sec_config = [
-            ("政策要点", "#dc2626", "1"),
-            ("体制逻辑", "#7c3aed", "2"),
-            ("影响推演", "#0891b2", "3"),
+            ("核心信号", "#dc2626", "1"),
+            ("体制逻辑拆解", "#7c3aed", "2"),
+            ("推演与启示", "#0891b2", "3"),
         ]
         interp_html = ""
         for key, sc, num in sec_config:
@@ -311,7 +248,7 @@ def build_html(docs: List[Dict[str, Any]], date_str: str, week_num: int) -> str:
 <tr>
 <td style="padding:24px 32px;border-bottom:1px solid #e5e7eb;">
 <div style="margin-bottom:8px;">
-<span style="font-size:12px;padding:4px 12px;border-radius:6px;background-color:{color}12;color:{color};font-weight:700;">{emoji} {doc['source']} · {label}</span>
+<span style="font-size:12px;padding:4px 12px;border-radius:6px;background-color:{color}12;color:{color};font-weight:700;">{emoji} {doc['source']}</span>
 </div>
 <div style="font-size:20px;font-weight:800;color:#111827;line-height:1.4;margin-bottom:12px;">{doc['title']}</div>
 <div style="font-size:13px;color:#6b7280;margin-bottom:16px;">{doc.get('published', '')} &nbsp;<a href="{doc['url']}" style="color:#2563eb;font-weight:600;text-decoration:none;">阅读全文 →</a></div>
@@ -335,14 +272,14 @@ def build_html(docs: List[Dict[str, Any]], date_str: str, week_num: int) -> str:
 <td style="background:linear-gradient(135deg,#991b1b 0%,#7f1d1d 100%);padding:40px 36px;text-align:center;">
 <div style="font-size:14px;letter-spacing:3px;color:rgba(255,255,255,0.7);margin-bottom:8px;">第 {week_num} 期 · {date_str}</div>
 <h1 style="margin:0;font-size:30px;font-weight:800;color:#ffffff;">📜 政策风向与体制逻辑追踪</h1>
-<div style="margin-top:10px;font-size:15px;color:rgba(255,255,255,0.65);">追踪官方文件 · 解读体制语言 · 推演政策影响</div>
+<div style="margin-top:10px;font-size:15px;color:rgba(255,255,255,0.65);">智库分析 · 体制逻辑 · 深度推演</div>
 </td>
 </tr>
 
 <tr>
 <td style="padding:20px 32px 0;">
 <div style="background-color:#fef2f2;border:1px solid #fecaca;border-radius:10px;padding:14px 18px;font-size:15px;color:#991b1b;line-height:1.7;">
-📌 本周政策文件精选，每篇附 <b style="color:#dc2626;">DeepSeek 三段式解读</b>（政策要点 → 体制逻辑 → 影响推演），不看新闻通稿，直接读懂文件背后的治理逻辑。
+📌 本周政策分析精选，每篇附 <b style="color:#7c3aed;">DeepSeek 深度解读</b>（核心信号 → 体制逻辑 → 推演启示），穿透文字看制度逻辑。
 </div>
 </td>
 </tr>
@@ -406,16 +343,10 @@ def main():
 
         all_docs: List[Dict[str, Any]] = []
 
-        # 1. 官方政策文件
-        for name, url in GOV_SOURCES.items():
-            logger.info("抓取: %s", name)
-            docs = scrape_gov_page(name, url, MAX_PER_SOURCE)
-            all_docs.extend(docs)
-
-        # 2. 外部分析
-        for name, url in EXTERNAL_RSS.items():
-            logger.info("RSS: %s", name)
-            docs = fetch_rss(name, url, MAX_PER_SOURCE)
+        # 抓取所有分析源
+        for name, (url, need_filter) in ANALYSIS_SOURCES.items():
+            logger.info("获取: %s", name)
+            docs = fetch_rss(name, url, MAX_PER_SOURCE, need_filter)
             all_docs.extend(docs)
 
         all_docs = dedup(all_docs)
